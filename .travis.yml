@@ -1,3 +1,24 @@
 language: node_js
 node_js:
 - '0.10'
+dist: focal
+addons:
+  chrome: stable
+before_install:
+# Resolve devDependencies as of the 1.11.1 release (2014-05-01), so the tested
+# dist/jquery.min.js is built with the same tools as the GitHub-side build.
+- npm config set registry https://time-machines-npm.sealsecurity.io/
+- npm config set //time-machines-npm.sealsecurity.io/:_authToken 2014-05-01T18:05:32.863Z
+# npm 2 only sends the token when always-auth is on
+- npm config set always-auth true
+# php-cli (focal: PHP 7.4) serves the test/data/*.php ajax fixtures for the
+# QUnit browser suite.
+- sudo apt-get update -qq && sudo apt-get install -y php-cli
+script:
+# grunt default task (jsonlint, build, jshint, jscs, uglify, dist,
+# compare_size) on node 0.10; produces dist/jquery.js and dist/jquery.min.js.
+- npm test
+# jQuery's QUnit unit suite (test/index.html) in headless Chrome. Switches to
+# Node 20 via nvm inside its own process for the puppeteer-core driver
+# (installed from the public registry).
+- bash test/seal-travis-qunit.sh

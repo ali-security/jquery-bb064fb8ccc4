@@ -1,0 +1,168 @@
+name: seal-build
+
+# Build and pack only. The QUnit unit suite runs on Travis (.travis.yml,
+# test/seal-travis-qunit.sh).
+on:
+  workflow_dispatch:
+
+jobs:
+  build-pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write container scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/seal"
+          cat > "$RUNNER_TEMP/seal/build.sh" <<'SEAL_BUILD_EOF'
+          set -euo pipefail
+          trap 'chown -R "$HOST_UID:$HOST_GID" /work' EXIT
+          node --version
+          npm --version
+          # Resolve devDependencies as of the 1.11.1 release (2014-05-01), so
+          # e.g. uglify-js resolves to 2.4.13 as it did for the published
+          # dist/jquery.min.js.
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken 2014-05-01T18:05:32.863Z
+          # npm 2 only sends the token when always-auth is on
+          npm config set always-auth true
+          # Run lifecycle scripts (e.g. commitplease's install hook) as the
+          # invoking user, as on Travis, instead of npm 2's root -> nobody drop.
+          npm config set unsafe-perm true
+          npm install
+          # grunt default task, same as Travis: jsonlint, build, jshint, jscs,
+          # uglify, dist, compare_size (grunt-cli 0.1.13 is a devDependency).
+          npm test
+          # dist/cdn/ copies, as build/release.js makeReleaseCopies does.
+          node /seal/cdn.js
+          ls -la dist dist/cdn
+          SEAL_BUILD_EOF
+          # Kept out of the source tree: build/ and dist/ are not captured, and
+          # test/**/*.js is jshint-ed with browser rules.
+          cat > "$RUNNER_TEMP/seal/cdn.js" <<'SEAL_CDN_EOF'
+          /*
+           * Seal: generate dist/cdn/ the way jQuery's release script does
+           * (build/release.js makeReleaseCopies), without the jquery-release
+           * machinery. Run from the repo root after `grunt` has produced
+           * dist/jquery{,.min}.js and dist/jquery.min.map.
+           *
+           * The version is pinned to the upstream release the CDN file names
+           * must carry (jquery-1.11.1.js etc.), independent of package.json's
+           * version. Must stay node 0.10 compatible (ES5, no shelljs).
+           */
+          "use strict";
+
+          var fs = require( "fs" ),
+
+              version = "1.11.1",
+
+              // 1.11.1 is a final release: release.js only skips the non-VER
+              // copies for pre-releases (Release.preRelease).
+              preRelease = false,
+
+              devFile = "dist/jquery.js",
+              minFile = "dist/jquery.min.js",
+              mapFile = "dist/jquery.min.map",
+
+              cdnFolder = "dist/cdn",
+
+              releaseFiles = {
+                "jquery-VER.js": devFile,
+                "jquery-VER.min.js": minFile,
+                "jquery-VER.min.map": mapFile,
+                "jquery.js": devFile,
+                "jquery.min.js": minFile,
+                "jquery.min.map": mapFile,
+                "jquery-latest.js": devFile,
+                "jquery-latest.min.js": minFile,
+                "jquery-latest.min.map": mapFile
+              };
+
+          if ( !fs.existsSync( cdnFolder ) ) {
+              fs.mkdirSync( cdnFolder );
+          }
+
+          Object.keys( releaseFiles ).forEach(function( key ) {
+              var text,
+                builtFile = releaseFiles[ key ],
+                unpathedFile = key.replace( /VER/g, version ),
+                releaseFile = cdnFolder + "/" + unpathedFile;
+
+              // Beta releases don't update the jquery-latest etc. copies
+              if ( !preRelease || key.indexOf( "VER" ) >= 0 ) {
+
+                if ( /\.map$/.test( releaseFile ) ) {
+                  // Map files need to reference the new uncompressed name;
+                  // assume that all files reside in the same directory.
+                  // "file":"jquery.min.js","sources":["jquery.js"]
+                  text = fs.readFileSync( builtFile, "utf8" )
+                    .replace( /"file":"([^"]+)","sources":\["([^"]+)"\]/,
+                      "\"file\":\"" + unpathedFile.replace( /\.min\.map/, ".min.js" ) +
+                      "\",\"sources\":[\"" + unpathedFile.replace( /\.min\.map/, ".js" ) + "\"]" );
+                  fs.writeFileSync( releaseFile, text );
+                } else if ( /\.min\.js$/.test( releaseFile ) ) {
+                  // Remove the source map comment; it causes way too many problems.
+                  // Keep the map file in case DevTools allow manual association.
+                  text = fs.readFileSync( builtFile, "utf8" )
+                    .replace( /\/\/# sourceMappingURL=\S+/, "" );
+                  fs.writeFileSync( releaseFile, text );
+                } else if ( builtFile !== releaseFile ) {
+                  // release.js: shell.cp( "-f", builtFile, releaseFile ) -- byte copy
+                  fs.writeFileSync( releaseFile, fs.readFileSync( builtFile ) );
+                }
+                console.log( "Created: " + releaseFile );
+              }
+          });
+          SEAL_CDN_EOF
+          cat > "$RUNNER_TEMP/seal/pack.sh" <<'SEAL_PACK_EOF'
+          set -euo pipefail
+          trap 'chown -R "$HOST_UID:$HOST_GID" /work' EXIT
+          node --version
+          npm --version
+          # Not part of the published package. node_modules is skipped by
+          # npm pack; .npmignore drops /build, /test, /Gruntfile.js, etc.
+          rm -rf .github
+          npm pack
+          mkdir -p seal-out
+          mv jquery-1.11.1.tgz seal-out/
+          tar tzf seal-out/jquery-1.11.1.tgz | sort
+          echo "member count: $(tar tzf seal-out/jquery-1.11.1.tgz | wc -l)"
+          SEAL_PACK_EOF
+
+      - name: Build (node 0.10 / npm 2, grunt)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v "$RUNNER_TEMP/seal:/seal" \
+            -w /work \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            node:0.10 bash /seal/build.sh
+          test -f dist/jquery.js
+          test -f dist/jquery.min.js
+          test -f dist/jquery.min.map
+          test -f dist/cdn/jquery-1.11.1.js
+
+      - name: Pack (node 0.10 / npm 2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -v "$RUNNER_TEMP/seal:/seal" \
+            -w /work \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            node:0.10 bash /seal/pack.sh
+          ls -la seal-out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jquery-npm
+          path: seal-out/jquery-1.11.1.tgz
+          if-no-files-found: error
